@@ -1,0 +1,4 @@
+# vLLM pulls in a matching torch build automatically — don't pin torch yourself.
+vllm==0.11.0
+transformers
+huggingface_hub
