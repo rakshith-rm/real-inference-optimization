@@ -130,8 +130,11 @@ def main() -> None:
 
     prompts = PROMPTS[:2] if args.quick else PROMPTS
 
-    if torch.cuda.device_count() < 2:
-        raise SystemExit("Need 2 GPUs. Run: python gpu_check.py")
+    if torch.cuda.device_count() < config.TENSOR_PARALLEL_SIZE:
+        raise SystemExit(
+            f"Need {config.TENSOR_PARALLEL_SIZE} GPU(s) for TP={config.TENSOR_PARALLEL_SIZE}. "
+            "Run: python gpu_check.py"
+        )
 
     baseline = run_mode("baseline (no speculative decoding)", False, prompts)
     spec = run_mode("EAGLE3 speculative decoding", True, prompts)

@@ -7,14 +7,15 @@ TARGET_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 EAGLE3_MODEL = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 
 # Shown in the resume line — set to whatever you actually ran on.
-HARDWARE_LABEL = "2x A6000"
+HARDWARE_LABEL = "A6000"
 
-# Target model is tensor-parallel across 2 GPUs.
-# Draft stays on 1 GPU (stable on vLLM; target still uses both).
-TENSOR_PARALLEL_SIZE = 2
+# Llama-8B fits on ONE A6000 (48GB). TP=1 avoids PCIe all-reduce overhead
+# that kills speculative decoding gains. Spec decoding wins at low batch / TP=1.
+TENSOR_PARALLEL_SIZE = 1
 DRAFT_TENSOR_PARALLEL_SIZE = 1
 
-NUM_SPECULATIVE_TOKENS = 3
+# k=2: pos-2 acceptance was only ~12% on this workload, so drafting 3 wasted work.
+NUM_SPECULATIVE_TOKENS = 2
 MAX_OUTPUT_TOKENS = 256
 GPU_MEMORY_UTILIZATION = 0.85
 

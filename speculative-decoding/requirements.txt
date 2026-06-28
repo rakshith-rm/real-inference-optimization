@@ -1,4 +1,4 @@
-# vLLM pulls in a matching torch build automatically — don't pin torch yourself.
+# vLLM 0.11.0 breaks with transformers 5.x (all_special_tokens_extended removed)
 vllm==0.11.0
-transformers
+transformers>=4.56.0,<5.0.0
 huggingface_hub
