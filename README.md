@@ -1,8 +1,8 @@
 # Real Inference Optimization
 
-**Baseline vs EAGLE3 speculative decoding** on Llama-3.1-8B using vLLM.
+**Baseline vs EAGLE3 speculative decoding** on Llama-3.1-8B using vLLM, plus a **selective speculation scheduler** that routes requests to baseline or EAGLE3 based on prompt length, temperature, and rolling draft acceptance rate.
 
-Proven on **1× A6000 48GB** (TP=1, k=2): **+8.8% throughput** over baseline.
+Proven on **1× A6000 48GB** (TP=1, k=2): **+8.8% throughput** over baseline with always-on EAGLE3.
 
 ## Setup
 
@@ -17,12 +17,12 @@ huggingface-cli login   # + accept Llama license on HuggingFace
 ```bash
 cd vllm_bench
 python gpu_check.py
-python benchmark.py --quick   # 2 prompts, smoke test
-python benchmark.py           # full prompt set
+python benchmark.py --quick   # smoke test
+python benchmark.py           # full benchmark
 ```
 
-Needs a cloud GPU with ~24GB+ VRAM (won't fit on 8GB laptop).
+Needs a cloud GPU with ~24GB+ VRAM (e.g. A6000).
 
 ## Config
 
-Edit `vllm_bench/config.py` — model names, `TENSOR_PARALLEL_SIZE`, `NUM_SPECULATIVE_TOKENS` (k).
+Edit `vllm_bench/config.py` — model names, `TENSOR_PARALLEL_SIZE`, `NUM_SPECULATIVE_TOKENS` (k), scheduler thresholds.

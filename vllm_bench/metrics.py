@@ -7,7 +7,12 @@ def spec_decode_stats(llm, num_spec_tokens: int) -> dict:
     num_drafts = num_draft_tokens = num_accepted = 0
     acceptance_by_pos = [0] * num_spec_tokens
 
-    for metric in llm.get_metrics():
+    try:
+        metrics = llm.get_metrics()
+    except (AssertionError, ValueError):
+        metrics = []
+
+    for metric in metrics:
         if metric.name == "vllm:spec_decode_num_drafts" and isinstance(metric, Counter):
             num_drafts += metric.value
         elif metric.name == "vllm:spec_decode_num_draft_tokens" and isinstance(metric, Counter):
@@ -37,7 +42,10 @@ def print_spec_decode_report(stats: dict) -> None:
     print(f"  draft tokens:     {stats['num_draft_tokens']}")
     print(f"  accepted tokens:  {stats['num_accepted_tokens']}")
     print(f"  mean accept len:  {stats['mean_acceptance_length']:.2f}  (1 + accepted/drafts)")
-    print(f"  draft accept %:   {stats['draft_accept_rate'] * 100:.1f}%")
+    if stats["num_drafts"] == 0 and stats["num_draft_tokens"] == 0:
+        print("  (no spec-decode counters — engine may have disable_log_stats=True)")
+    else:
+        print(f"  draft accept %:   {stats['draft_accept_rate'] * 100:.1f}%")
     for i, count in enumerate(stats["acceptance_by_pos"]):
         rate = count / stats["num_drafts"] if stats["num_drafts"] else 0.0
         print(f"  pos {i} accept rate: {rate * 100:.1f}%")

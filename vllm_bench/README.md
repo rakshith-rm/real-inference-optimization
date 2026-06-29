@@ -1,6 +1,8 @@
 # EAGLE3 Speculative Decoding Benchmark (vLLM)
 
-Baseline vs EAGLE3 on Llama-3.1-8B. Default: **TP=1, k=2** (tuned for A6000).
+Baseline vs always-on EAGLE3 vs **selective speculation scheduler** on Llama-3.1-8B.
+Default: **TP=1, k=2** (tuned for A6000). Workload mixes short prompts, high-temperature
+creative requests, and long-context analytical prompts.
 
 ## Run
 
@@ -8,8 +10,8 @@ Baseline vs EAGLE3 on Llama-3.1-8B. Default: **TP=1, k=2** (tuned for A6000).
 # from repo root (after pip install -r requirements.txt)
 cd vllm_bench
 python gpu_check.py
-python benchmark.py --quick
-python benchmark.py
+python benchmark.py --quick   # 7-prompt smoke test
+python benchmark.py           # full 35-prompt workload
 ```
 
 Optional — GPU utilization in a second terminal:
@@ -22,14 +24,16 @@ python gpu_watch.py
 
 | File | Purpose |
 |------|---------|
-| `config.py` | Models, TP, k, memory |
-| `benchmark.py` | Baseline → EAGLE3, throughput + acceptance stats |
+| `config.py` | Models, TP, k, memory, scheduler thresholds |
+| `prompts.py` | Mixed workload (`WORKLOAD`, `QUICK_WORKLOAD`) |
+| `scheduler.py` | Per-request speculation routing policy |
+| `benchmark.py` | Baseline → always-EAGLE3 → selective scheduler |
 | `metrics.py` | vLLM spec-decode counters |
 | `gpu_check.py` | Verify GPU before load |
 
 ## Results (A6000, TP=1, k=2)
 
-- Throughput: **+8.8%** vs baseline
+- Always-on EAGLE3 throughput: **+8.8%** vs baseline
 - Mean accept length: **~1.64**
 
 ## Troubleshooting
