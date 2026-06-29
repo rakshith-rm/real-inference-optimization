@@ -22,7 +22,11 @@ ADAPTIVE_UPDATE_INTERVAL = 3    # re-evaluate every N verify batches
 
 MAX_OUTPUT_TOKENS = 256
 TEMPERATURE = 0.0
-GPU_MEMORY_FRACTION = 0.85
+GPU_MEMORY_FRACTION = 0.80  # leave headroom for EAGLE3 draft head + graphs
+
+# Brev/cloud VMs often have GPU drivers but no nvcc. FlashInfer JIT fails without it.
+ATTENTION_BACKEND = "triton"
+CUDA_GRAPH_BACKEND_PREFILL = "disabled"
 
 HOST = "127.0.0.1"
 PORT = 30000

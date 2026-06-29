@@ -41,6 +41,9 @@ def build_command(mode: str) -> list[str]:
         "--tp-size", str(config.TENSOR_PARALLEL_SIZE),
         "--mem-fraction-static", str(config.GPU_MEMORY_FRACTION),
         "--trust-remote-code",
+        # Avoid flashinfer JIT — needs nvcc, missing on many cloud VMs
+        "--attention-backend", config.ATTENTION_BACKEND,
+        "--cuda-graph-backend-prefill", config.CUDA_GRAPH_BACKEND_PREFILL,
     ]
     if mode == "baseline":
         return cmd
