@@ -1,16 +1,12 @@
-"""
-Baseline vs EAGLE3 speculative decoding on a 2-GPU node (A6000/A100/etc).
+﻿"""
+Baseline vs EAGLE3 speculative decoding on Llama-3.1-8B (vLLM).
 
-What uses both GPUs:
-  - Target model: tensor_parallel_size=2  -> layers split across GPU 0 & 1
-  - EAGLE3 draft: draft_tensor_parallel_size=1 -> runs on GPU 0
-    (GPU 1 still busy verifying draft tokens via the TP target model)
+Default config: TP=1, k=2 (best on A6000). See config.py.
 
 Run:
-  python gpu_check.py          # sanity check
-  python gpu_watch.py          # optional, second terminal
+  python gpu_check.py
+  python benchmark.py --quick
   python benchmark.py
-  python benchmark.py --quick  # 2 prompts, for a fast smoke test
 """
 
 from __future__ import annotations

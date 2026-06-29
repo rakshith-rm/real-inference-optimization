@@ -1,0 +1,10 @@
+# Shared
+huggingface_hub
+requests
+
+# vLLM (vllm/ — transformers 5.x breaks vLLM 0.11.0)
+vllm==0.11.0
+transformers>=4.56.0,<5.0.0
+
+# SGLang (sglang/ — see https://docs.sglang.io/start/install.html if CUDA wheels conflict)
+sglang[all]>=0.4.6

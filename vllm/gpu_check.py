@@ -1,9 +1,11 @@
-"""Verify 2 GPUs are visible before spending time loading models."""
+﻿"""Verify enough GPUs are visible before loading models."""
 
 import subprocess
 import sys
 
 import torch
+
+import config
 
 
 def main() -> None:
@@ -13,12 +15,16 @@ def main() -> None:
         props = torch.cuda.get_device_properties(i)
         print(f"  [{i}] {props.name} — {props.total_memory // (1024**3)} GiB")
 
-    if count < 2:
-        print("\nERROR: need at least 2 GPUs for this project (tensor_parallel_size=2).")
+    need = config.TENSOR_PARALLEL_SIZE
+    if count < need:
+        print(f"\nERROR: need {need} GPU(s) for TP={need}.")
         sys.exit(1)
 
     print("\nnvidia-smi snapshot:")
-    subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total,utilization.gpu", "--format=csv"], check=False)
+    subprocess.run(
+        ["nvidia-smi", "--query-gpu=index,name,memory.total,utilization.gpu", "--format=csv"],
+        check=False,
+    )
 
 
 if __name__ == "__main__":

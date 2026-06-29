@@ -1,27 +1,14 @@
-# Speculative Decoding Benchmark (vLLM + EAGLE3, 2× A100)
+# Speculative Decoding Benchmark (vLLM + EAGLE3)
 
-Small project: **baseline vs EAGLE3** on Llama-3.1-8B with **tensor parallel = 2** so both GPUs participate.
+Baseline vs EAGLE3 on Llama-3.1-8B. Default config: **TP=1, k=2** (best on A6000).
 
-## How both GPUs are used
-
-| Component | GPUs | Config |
-|-----------|------|--------|
-| Target model (Llama 3.1 8B) | **0 + 1** | `tensor_parallel_size=2` |
-| EAGLE3 draft head | **0** | `draft_tensor_parallel_size=1` |
-
-GPU 1 is not idle — it runs half the target layers during draft **verification** (the expensive step speculative decoding saves).
-
-## Setup (cloud node)
+## Setup
 
 ```bash
-# 1. HuggingFace token (Llama is gated)
-export HF_TOKEN=hf_...
-huggingface-cli login --token "$HF_TOKEN"
-
-# 2. Run
-cd speculative-decoding
-bash run.sh          # full benchmark (~8 prompts)
-bash run.sh --quick  # smoke test (2 prompts)
+# from repo root (after: pip install -r requirements.txt)
+python gpu_check.py
+python benchmark.py --quick
+python benchmark.py
 ```
 
 In a **second terminal** while benchmarking:
