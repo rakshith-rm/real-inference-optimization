@@ -6,7 +6,7 @@ Baseline vs EAGLE3 on Llama-3.1-8B. Default: **TP=1, k=2** (tuned for A6000).
 
 ```bash
 # from repo root (after pip install -r requirements.txt)
-cd vllm
+cd vllm_bench
 python gpu_check.py
 python benchmark.py --quick
 python benchmark.py
