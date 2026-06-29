@@ -21,3 +21,13 @@ cd ../sglang && python benchmark.py --quick
 ```
 
 Both need a cloud GPU with ~16GB+ VRAM (Llama-8B + EAGLE3 head). Won't fit on 8GB laptop.
+
+**Important:** install **one stack per venv** — vLLM and SGLang conflict if installed together.
+
+```bash
+# SGLang (sglang/ benchmark)
+pip install -r requirements.txt
+
+# vLLM (vllm/ benchmark) — separate venv recommended
+pip install -r requirements-vllm.txt
+```
