@@ -1,11 +1,4 @@
-# Install ONE stack per venv — do NOT pip install vllm + sglang together (conflicts).
-#
-# For sglang/ benchmark (default):
-#   pip install -r requirements.txt
-#
-# For vllm/ benchmark, use instead:
-#   pip install -r requirements-vllm.txt
-
-requests
+vllm==0.11.0
+transformers>=4.56.0,<5.0.0
 huggingface_hub
-sglang>=0.4.6
+requests

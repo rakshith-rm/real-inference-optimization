@@ -1,44 +1,39 @@
-# Speculative Decoding Benchmark (vLLM + EAGLE3)
+# EAGLE3 Speculative Decoding Benchmark (vLLM)
 
-Baseline vs EAGLE3 on Llama-3.1-8B. Default config: **TP=1, k=2** (best on A6000).
+Baseline vs EAGLE3 on Llama-3.1-8B. Default: **TP=1, k=2** (tuned for A6000).
 
-## Setup
+## Run
 
 ```bash
-# from repo root (after: pip install -r requirements.txt)
+# from repo root (after pip install -r requirements.txt)
+cd vllm
 python gpu_check.py
 python benchmark.py --quick
 python benchmark.py
 ```
 
-In a **second terminal** while benchmarking:
+Optional — GPU utilization in a second terminal:
 
 ```bash
 python gpu_watch.py
 ```
 
-You should see **both GPUs** with high utilization during generation.
-
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `config.py` | Model names, TP sizes, token counts |
-| `benchmark.py` | Loads baseline → EAGLE3, prints throughput + acceptance stats |
-| `metrics.py` | Reads vLLM spec-decode counters |
-| `gpu_check.py` | Verify 2 GPUs before loading models |
-| `gpu_watch.py` | Live `nvidia-smi` poll |
+| `config.py` | Models, TP, k, memory |
+| `benchmark.py` | Baseline → EAGLE3, throughput + acceptance stats |
+| `metrics.py` | vLLM spec-decode counters |
+| `gpu_check.py` | Verify GPU before load |
 
-## Expected results (2× A100 80GB, 8 prompts, 256 max tokens)
+## Results (A6000, TP=1, k=2)
 
-Rough ballpark — your numbers will vary:
-
-- **Throughput:** ~30–60% higher with EAGLE3
-- **Mean acceptance length:** ~2.5–3.0 (with `num_speculative_tokens=3`)
-- **Draft accept rate:** ~60–75%
+- Throughput: **+8.8%** vs baseline
+- Mean accept length: **~1.64**
 
 ## Troubleshooting
 
-- **NCCL timeout with `draft_tensor_parallel_size=2`:** keep draft TP at 1 (already set in `config.py`).
-- **OOM:** lower `GPU_MEMORY_UTILIZATION` in `config.py` to `0.75`.
-- **Slow first run:** models download from HuggingFace; warmup run is intentional.
+- **OOM:** lower `GPU_MEMORY_UTILIZATION` in `config.py`
+- **Llama 403:** `huggingface-cli login` + accept model license
+- **transformers error:** keep `transformers<5.0` (pinned in requirements.txt)
