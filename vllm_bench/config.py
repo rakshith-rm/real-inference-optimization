@@ -6,11 +6,7 @@ TARGET_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 # EAGLE3 draft head matched to Llama 3.1 8B
 EAGLE3_MODEL = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 
-# Shown in the resume line — set to whatever you actually ran on.
-HARDWARE_LABEL = "A6000"
-
-# Llama-8B fits on ONE A6000 (48GB). TP=1 avoids PCIe all-reduce overhead
-# that kills speculative decoding gains. Spec decoding wins at low batch / TP=1.
+# Llama-8B fits on ONE A6000 (48GB). TP=1 avoids PCIe all-reduce overhead.
 TENSOR_PARALLEL_SIZE = 1
 DRAFT_TENSOR_PARALLEL_SIZE = 1
 

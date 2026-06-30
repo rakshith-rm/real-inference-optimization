@@ -1,16 +1,11 @@
 ﻿"""
 Baseline vs EAGLE3 vs selective speculation scheduler (vLLM).
 
-Each engine runs in its own subprocess (GPU memory freed on exit).
-All three modes use the same generate loop (one prompt per llm.generate call).
+Each engine runs in its own subprocess. All modes use one prompt per generate()
+call (vLLM 0.11 EAGLE3 hangs on batched spec).
 
-vLLM 0.11 EAGLE3 hangs on batched spec (batch>1) on mixed workloads — batch=1
-is required for stability and is the fair comparison point for spec decoding anyway.
-
-Run:
   python gpu_check.py
-  python benchmark.py --quick
-  python benchmark.py
+  python benchmark.py [--quick]
 """
 
 from __future__ import annotations
@@ -21,8 +16,9 @@ import time
 from collections import Counter
 
 import config
+from metrics import print_spec_summary, spec_decode_stats
 from prompts import QUICK_WORKLOAD, WORKLOAD
-from scheduler import SelectiveSpecScheduler, prompt_token_count
+from scheduler import Request, SelectiveSpecScheduler, prompt_token_count
 
 
 def _build_llm(use_speculative: bool):
@@ -34,7 +30,6 @@ def _build_llm(use_speculative: bool):
         "gpu_memory_utilization": config.GPU_MEMORY_UTILIZATION,
         "max_num_seqs": 1,
         "trust_remote_code": True,
-        "disable_log_stats": False,
     }
     if use_speculative:
         kwargs["speculative_config"] = {
@@ -46,80 +41,76 @@ def _build_llm(use_speculative: bool):
     return LLM(**kwargs)
 
 
-def _params(reqs: list[tuple]):
+def _sp(temperature: float, max_tokens: int):
     from vllm import SamplingParams
 
-    return [SamplingParams(temperature=t, max_tokens=m) for _, _, t, m in reqs]
+    return SamplingParams(temperature=temperature, max_tokens=max_tokens)
 
 
-def _tokens(outs) -> int:
+def _out_tokens(outs) -> int:
     return sum(len(o.outputs[0].token_ids) for o in outs)
 
 
-def _generate_all(llm, reqs: list[tuple]) -> tuple[int, float]:
-    """One prompt per generate call — same for all modes, stable on vLLM 0.11."""
-    total_tokens = 0
-    elapsed = 0.0
-    for n, req in enumerate(reqs, 1):
+def _generate_all(llm, reqs: list[Request]) -> tuple[int, float]:
+    tokens, elapsed = 0, 0.0
+    for n, (_, prompt, temp, max_tok) in enumerate(reqs, 1):
         t0 = time.perf_counter()
-        outs = llm.generate([req[1]], _params([req])[0])
+        outs = llm.generate([prompt], _sp(temp, max_tok))
         elapsed += time.perf_counter() - t0
-        total_tokens += _tokens(outs)
+        tokens += _out_tokens(outs)
         if n % 5 == 0 or n == len(reqs):
             print(f"    {n}/{len(reqs)} prompts done", flush=True)
-    return total_tokens, elapsed
+    return tokens, elapsed
 
 
-def _run_engine(use_speculative: bool, reqs: list[tuple], q) -> None:
-    from metrics import spec_decode_stats
-
+def _load_llm(use_speculative: bool, warmup: Request) -> tuple:
     t0 = time.perf_counter()
     llm = _build_llm(use_speculative)
     load_s = time.perf_counter() - t0
+    _, prompt, temp, max_tok = warmup
+    llm.generate([prompt], _sp(temp, max_tok))
+    return llm, load_s
 
-    llm.generate([reqs[0][1]], _params(reqs[:1])[0])  # warmup
 
+def _run_engine(use_speculative: bool, reqs: list[Request], q) -> None:
+    llm, load_s = _load_llm(use_speculative, reqs[0])
     tokens, elapsed = _generate_all(llm, reqs)
-    result = {
+    q.put({
         "output_tokens": tokens,
         "elapsed_s": elapsed,
         "load_s": load_s,
         "tokens_per_sec": tokens / elapsed if elapsed else 0.0,
         "sec_per_request": elapsed / len(reqs) if reqs else 0.0,
-    }
-    if use_speculative:
-        result["spec_stats"] = spec_decode_stats(llm, config.NUM_SPECULATIVE_TOKENS)
-    q.put(result)
+        "spec_stats": spec_decode_stats(llm, config.NUM_SPECULATIVE_TOKENS) if use_speculative else None,
+    })
 
 
-def _run_spec_phase(reqs: list[tuple], q) -> None:
-    from metrics import spec_decode_stats
-
+def _run_spec_phase(reqs: list[Request], q) -> None:
     sched = SelectiveSpecScheduler()
-    t0 = time.perf_counter()
-    llm = _build_llm(True)
-    load_s = time.perf_counter() - t0
-    llm.generate([reqs[0][1]], _params(reqs[:1])[0])
+    llm, load_s = _load_llm(True, reqs[0])
 
     tokens = executed = 0
     elapsed = 0.0
-    demoted, logs, stats = [], [], None
+    demoted: list[Request] = []
+    logs: list[str] = []
+    stats = None
     remaining = list(reqs)
     while remaining:
         if sched.has_acceptance_samples and sched.rolling_accept_rate < config.SCHED_MIN_ROLLING_ACCEPT_RATE:
-            demoted.extend(r[0] for r in remaining)
+            demoted.extend(remaining)
             logs.append(
                 f"  rolling accept {sched.rolling_accept_rate:.2f} < "
                 f"{config.SCHED_MIN_ROLLING_ACCEPT_RATE} — demoting {len(remaining)} to baseline"
             )
             break
         req = remaining.pop(0)
-        t1 = time.perf_counter()
-        outs = llm.generate([req[1]], _params([req])[0])
-        elapsed += time.perf_counter() - t1
+        _, prompt, temp, max_tok = req
+        t0 = time.perf_counter()
+        outs = llm.generate([prompt], _sp(temp, max_tok))
+        elapsed += time.perf_counter() - t0
         stats = spec_decode_stats(llm, config.NUM_SPECULATIVE_TOKENS)
         sched.record_acceptance(stats["mean_acceptance_length"])
-        tokens += _tokens(outs)
+        tokens += _out_tokens(outs)
         executed += 1
         logs.append(f"  spec {executed}/{len(reqs)}: rolling accept={sched.rolling_accept_rate:.2f}")
 
@@ -137,31 +128,27 @@ def _run_spec_phase(reqs: list[tuple], q) -> None:
 def _spawn(target, *args):
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
-    proc = ctx.Process(target=target, args=(*args, q))
-    proc.start()
+    p = ctx.Process(target=target, args=(*args, q))
+    p.start()
     result = q.get()
-    proc.join()
+    p.join()
     return result
 
 
-def _print_spec(stats: dict | None) -> None:
-    if not stats:
-        return
-    print("\n--- Speculative decoding stats ---")
-    print(f"  mean accept len: {stats['mean_acceptance_length']:.2f}  draft accept %: {stats['draft_accept_rate'] * 100:.1f}")
-    for i, c in enumerate(stats["acceptance_by_pos"]):
-        rate = c / stats["num_drafts"] if stats["num_drafts"] else 0.0
-        print(f"  pos {i} accept rate: {rate * 100:.1f}%")
+def _print_results(tokens, elapsed, load_s, n_reqs, spec_stats=None, *, inference_label="wall"):
+    print(f"  engine load:     {load_s:.1f}s")
+    print(f"  output tokens:   {tokens}  {inference_label}: {elapsed:.2f}s")
+    tps = tokens / elapsed if elapsed else 0.0
+    print(f"  throughput:      {tps:.1f} tok/s  latency/req: {elapsed / n_reqs:.2f}s")
+    print_spec_summary(spec_stats)
+    return tps
 
 
-def run_homogeneous(name: str, use_speculative: bool, reqs: list[tuple]) -> dict:
+def run_homogeneous(name: str, use_speculative: bool, reqs: list[Request]) -> dict:
     print(f"\n{'=' * 60}\n{name}\n{'=' * 60}")
     r = _spawn(_run_engine, use_speculative, reqs)
-    print(f"  engine load:     {r['load_s']:.1f}s")
-    print(f"  output tokens:   {r['output_tokens']}  wall: {r['elapsed_s']:.2f}s")
-    print(f"  throughput:      {r['tokens_per_sec']:.1f} tok/s  latency/req: {r['sec_per_request']:.2f}s")
-    _print_spec(r.get("spec_stats"))
-    return r
+    tps = _print_results(r["output_tokens"], r["elapsed_s"], r["load_s"], len(reqs), r.get("spec_stats"))
+    return {**r, "tokens_per_sec": tps}
 
 
 def run_selective(requests) -> dict:
@@ -169,12 +156,10 @@ def run_selective(requests) -> dict:
     sched = SelectiveSpecScheduler()
     spec, base = [], []
     for idx, req in enumerate(requests):
-        decision = sched.decide(prompt_token_count(req.prompt), req.temperature)
-        sched.log_decision(decision)
-        entry = (idx, req.prompt, req.temperature, req.max_tokens)
-        (spec if decision.use_speculation else base).append(entry)
-    routed_spec = sum(1 for d in sched.routing_log if d.use_speculation)
-    print(f"  routing: {routed_spec} spec / {len(sched.routing_log) - routed_spec} baseline  {dict(sched.reason_counts())}")
+        use_spec, _ = sched.decide(prompt_token_count(req.prompt), req.temperature)
+        entry: Request = (idx, req.prompt, req.temperature, req.max_tokens)
+        (spec if use_spec else base).append(entry)
+    print(f"  routing: {len(spec)} spec / {len(base)} baseline  {sched.reason_counts()}")
 
     tokens = elapsed = load = 0.0
     executed_spec = 0
@@ -188,15 +173,16 @@ def run_selective(requests) -> dict:
         load += sr["load_s"]
         executed_spec = sr["executed"]
         stats = sr["spec_stats"]
-        base += [(i, requests[i].prompt, requests[i].temperature, requests[i].max_tokens) for i in sr["demoted"]]
+        base.extend(sr["demoted"])
     if base:
         br = _spawn(_run_engine, False, base)
         tokens += br["output_tokens"]
         elapsed += br["elapsed_s"]
         load += br["load_s"]
 
-    tps = tokens / elapsed if elapsed else 0.0
-    r = {
+    print(f"  executed:        {executed_spec} spec / {len(base)} baseline")
+    tps = _print_results(tokens, elapsed, load, len(requests), stats, inference_label="inference")
+    return {
         "output_tokens": tokens,
         "elapsed_s": elapsed,
         "load_s": load,
@@ -204,26 +190,18 @@ def run_selective(requests) -> dict:
         "sec_per_request": elapsed / len(requests) if requests else 0.0,
         "executed_spec": executed_spec,
         "executed_baseline": len(base),
-        "routing_reasons": dict(sched.reason_counts()),
+        "routing_reasons": sched.reason_counts(),
         "spec_stats": stats,
     }
-    print(f"  executed:        {executed_spec} spec / {len(base)} baseline")
-    print(f"  output tokens:   {tokens}  inference: {elapsed:.2f}s  load: {load:.1f}s")
-    print(f"  throughput:      {tps:.1f} tok/s  latency/req: {r['sec_per_request']:.2f}s")
-    _print_spec(stats)
-    return r
 
 
 def print_comparison(baseline: dict, spec: dict, sel: dict) -> None:
-    def gain(a, b):
+    def pct(a, b):
         return (a / b - 1) * 100 if b else 0.0
 
+    b, s, x = baseline["tokens_per_sec"], spec["tokens_per_sec"], sel["tokens_per_sec"]
     print(f"\n{'=' * 60}\nCOMPARISON (batch=1, fair)\n{'=' * 60}")
-    print(
-        f"  throughput tok/s:  baseline {baseline['tokens_per_sec']:.1f} | "
-        f"always-spec {spec['tokens_per_sec']:.1f} ({gain(spec['tokens_per_sec'], baseline['tokens_per_sec']):+.1f}%) | "
-        f"selective {sel['tokens_per_sec']:.1f} ({gain(sel['tokens_per_sec'], baseline['tokens_per_sec']):+.1f}% vs base)"
-    )
+    print(f"  throughput tok/s:  baseline {b:.1f} | always-spec {s:.1f} ({pct(s, b):+.1f}%) | selective {x:.1f} ({pct(x, b):+.1f}% vs base)")
     if spec.get("spec_stats"):
         print(f"  always-spec mean accept length: {spec['spec_stats']['mean_acceptance_length']:.2f}")
     print(f"  selective routed: {sel['executed_spec']} spec / {sel['executed_baseline']} baseline  {sel['routing_reasons']}")
