@@ -30,6 +30,7 @@ def _build_llm(use_speculative: bool):
         "model": config.TARGET_MODEL,
         "tensor_parallel_size": config.TENSOR_PARALLEL_SIZE,
         "gpu_memory_utilization": config.GPU_MEMORY_UTILIZATION,
+        "max_num_seqs": config.MAX_NUM_SEQS,
         "trust_remote_code": True,
         "disable_log_stats": False,
     }
