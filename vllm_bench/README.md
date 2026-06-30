@@ -4,6 +4,10 @@ Baseline vs always-on EAGLE3 vs **selective speculation scheduler** on Llama-3.1
 Default: **TP=1, k=2** (tuned for A6000). Workload mixes short prompts, high-temperature
 creative requests, and long-context analytical prompts.
 
+All three modes generate in a **single batch** so the comparison is fair, and
+**each engine runs in its own subprocess** so its GPU memory is fully released when
+it exits (no reload OOM).
+
 ## Run
 
 ```bash
@@ -31,10 +35,12 @@ python gpu_watch.py
 | `metrics.py` | vLLM spec-decode counters |
 | `gpu_check.py` | Verify GPU before load |
 
-## Results (A6000, TP=1, k=2)
+## Reading the results
 
-- Always-on EAGLE3 throughput: **+8.8%** vs baseline
-- Mean accept length: **~1.64**
+Speculative decoding helps most on long, low-temperature prompts (higher draft
+acceptance) and hurts on short/high-temperature ones (draft overhead with little
+acceptance). The selective scheduler routes per request to capture the gains while
+avoiding the losses, and the `mean accept length` reported per run quantifies why.
 
 ## Troubleshooting
 

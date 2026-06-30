@@ -2,7 +2,9 @@
 
 **Baseline vs EAGLE3 speculative decoding** on Llama-3.1-8B using vLLM, plus a **selective speculation scheduler** that routes requests to baseline or EAGLE3 based on prompt length, temperature, and rolling draft acceptance rate.
 
-Proven on **1× A6000 48GB** (TP=1, k=2): **+8.8% throughput** over baseline with always-on EAGLE3.
+Runs on **1× A6000 48GB** (TP=1, k=2). All modes generate in a single batch for a
+fair comparison, and each engine runs in its own subprocess so its GPU memory is
+fully released when it exits.
 
 ## Setup
 

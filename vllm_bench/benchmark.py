@@ -1,7 +1,9 @@
 ﻿"""
 Baseline vs EAGLE3 vs selective speculation scheduler (vLLM).
 
-Default config: TP=1, k=2 (best on A6000). See config.py.
+Each engine runs in its own subprocess, so its GPU memory is fully reclaimed when
+the process exits — a simple, reliable fix for the reload OOM. All three modes
+generate in a single batch, so the comparison is fair.
 
 Run:
   python gpu_check.py
@@ -12,21 +14,19 @@ Run:
 from __future__ import annotations
 
 import argparse
-import gc
+import multiprocessing as mp
 import time
 from collections import Counter
 
-import torch
-from vllm import LLM, SamplingParams
-
 import config
-from metrics import print_spec_decode_report, spec_decode_stats
-from prompts import QUICK_WORKLOAD, WORKLOAD, BenchmarkRequest
+from prompts import QUICK_WORKLOAD, WORKLOAD
 from scheduler import SelectiveSpecScheduler, prompt_token_count
 
 
-def build_llm(*, use_speculative: bool) -> LLM:
-    kwargs: dict = {
+def _build_llm(use_speculative: bool):
+    from vllm import LLM
+
+    kwargs = {
         "model": config.TARGET_MODEL,
         "tensor_parallel_size": config.TENSOR_PARALLEL_SIZE,
         "gpu_memory_utilization": config.GPU_MEMORY_UTILIZATION,
@@ -43,317 +43,204 @@ def build_llm(*, use_speculative: bool) -> LLM:
     return LLM(**kwargs)
 
 
-def sampling_params_for(requests: list[BenchmarkRequest]) -> list[SamplingParams]:
-    return [
-        SamplingParams(temperature=r.temperature, max_tokens=r.max_tokens)
-        for r in requests
-    ]
+def _params(reqs: list[tuple]):
+    from vllm import SamplingParams
+
+    return [SamplingParams(temperature=t, max_tokens=m) for _, _, t, m in reqs]
 
 
-def count_output_tokens(outputs) -> int:
-    return sum(len(o.outputs[0].token_ids) for o in outputs)
+def _tokens(outs) -> int:
+    return sum(len(o.outputs[0].token_ids) for o in outs)
 
 
-def generate_requests(
-    llm: LLM,
-    requests: list[BenchmarkRequest],
-    *,
-    sequential: bool = False,
-):
-    """Run generation. Sequential mode avoids vLLM 0.11 prometheus spec-metrics crash on batches."""
-    prompts = [r.prompt for r in requests]
-    params = sampling_params_for(requests)
-    if not sequential or len(requests) <= 1:
-        return llm.generate(prompts, params)
-    outputs = []
-    for prompt, param in zip(prompts, params):
-        outputs.extend(llm.generate([prompt], param))
-    return outputs
+def _run_engine(use_speculative: bool, reqs: list[tuple], q) -> None:
+    """Subprocess: load one engine, generate the whole batch, return metrics."""
+    from metrics import spec_decode_stats
 
+    t0 = time.perf_counter()
+    llm = _build_llm(use_speculative)
+    load_s = time.perf_counter() - t0
 
-def release_gpu() -> None:
-    """Best-effort VRAM cleanup between vLLM engine loads."""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        if hasattr(torch.cuda, "ipc_collect"):
-            torch.cuda.ipc_collect()
-    time.sleep(5)
+    prompts = [p for _, p, _, _ in reqs]
+    params = _params(reqs)
+    llm.generate(prompts[:1], params[0])  # warmup, excluded from timing
 
+    t1 = time.perf_counter()
+    outs = llm.generate(prompts, params)
+    elapsed = time.perf_counter() - t1
 
-def unload_llm(llm: LLM) -> None:
-    del llm
-    release_gpu()
-
-
-def run_homogeneous(
-    name: str,
-    *,
-    use_speculative: bool,
-    requests: list[BenchmarkRequest],
-) -> dict:
-    print(f"\n{'=' * 60}")
-    print(f"Loading: {name}")
-    print(
-        f"  target TP={config.TENSOR_PARALLEL_SIZE}, "
-        f"draft TP={config.DRAFT_TENSOR_PARALLEL_SIZE if use_speculative else 'n/a'}"
-    )
-    print(f"{'=' * 60}")
-
-    load_start = time.perf_counter()
-    llm = build_llm(use_speculative=use_speculative)
-    load_s = time.perf_counter() - load_start
-    print(f"Engine ready in {load_s:.1f}s")
-
-    prompts = [r.prompt for r in requests]
-    params = sampling_params_for(requests)
-
-    _ = llm.generate([prompts[0]], params[0])
-
-    start = time.perf_counter()
-    outputs = generate_requests(llm, requests, sequential=use_speculative)
-    elapsed = time.perf_counter() - start
-
-    total_tokens = count_output_tokens(outputs)
-    tokens_per_sec = total_tokens / elapsed if elapsed else 0.0
-    sec_per_request = elapsed / len(requests) if requests else 0.0
-
+    tokens = _tokens(outs)
     result = {
-        "name": name,
-        "prompts": len(requests),
-        "output_tokens": total_tokens,
+        "output_tokens": tokens,
         "elapsed_s": elapsed,
-        "tokens_per_sec": tokens_per_sec,
-        "sec_per_request": sec_per_request,
         "load_s": load_s,
+        "tokens_per_sec": tokens / elapsed if elapsed else 0.0,
+        "sec_per_request": elapsed / len(reqs) if reqs else 0.0,
     }
-
-    print(f"\n--- {name} results ---")
-    print(f"  prompts:         {len(requests)}")
-    print(f"  output tokens:   {total_tokens}")
-    print(f"  wall time:       {elapsed:.2f}s")
-    print(f"  throughput:      {tokens_per_sec:.1f} tok/s")
-    print(f"  latency/request: {sec_per_request:.2f}s")
-
     if use_speculative:
-        stats = spec_decode_stats(llm, config.NUM_SPECULATIVE_TOKENS)
-        print_spec_decode_report(stats)
-        result["spec_stats"] = stats
-
-    unload_llm(llm)
-    return result
+        result["spec_stats"] = spec_decode_stats(llm, config.NUM_SPECULATIVE_TOKENS)
+    q.put(result)
 
 
-def run_selective(requests: list[BenchmarkRequest]) -> dict:
-    """Route each request to baseline or EAGLE3 using the selective scheduler."""
-    name = "selective speculation scheduler"
-    print(f"\n{'=' * 60}")
-    print(f"Loading: {name}")
-    print(f"{'=' * 60}")
+def _run_spec_phase(reqs: list[tuple], q) -> None:
+    """Subprocess: spec engine, batched chunks with rolling-accept demotion."""
+    from metrics import spec_decode_stats
 
-    scheduler = SelectiveSpecScheduler()
-    baseline_queue: list[tuple[int, BenchmarkRequest]] = []
-    spec_queue: list[tuple[int, BenchmarkRequest]] = []
+    sched = SelectiveSpecScheduler()
+    t0 = time.perf_counter()
+    llm = _build_llm(True)
+    load_s = time.perf_counter() - t0
+    llm.generate([reqs[0][1]], _params(reqs[:1])[0])  # warmup
 
-    print("\n--- Initial routing (static rules + rolling accept rate) ---")
-    for idx, req in enumerate(requests):
-        tokens = prompt_token_count(req.prompt)
-        decision = scheduler.decide(tokens, req.temperature)
-        scheduler.log_decision(decision)
-        target = spec_queue if decision.use_speculation else baseline_queue
-        target.append((idx, req))
-        print(
-            f"  [{req.category:18}] tokens={tokens:3d} temp={req.temperature:.2f} "
-            f"-> {'SPEC' if decision.use_speculation else 'base':4s} ({decision.reason})"
-        )
-
-    outputs_by_idx: dict[int, object] = {}
-    total_load_s = 0.0
-    total_elapsed_s = 0.0
-    spec_stats_agg: dict | None = None
-    executed_spec = 0
-    executed_baseline = 0
-
-    if spec_queue:
-        print(f"\n--- Spec engine: {len(spec_queue)} request(s), chunked adaptive routing ---")
-        load_start = time.perf_counter()
-        llm = build_llm(use_speculative=True)
-        total_load_s += time.perf_counter() - load_start
-        print(f"Spec engine ready in {time.perf_counter() - load_start:.1f}s")
-
-        _ = llm.generate([spec_queue[0][1].prompt], sampling_params_for([spec_queue[0][1]])[0])
-
-        remaining = list(spec_queue)
-        demoted: list[tuple[int, BenchmarkRequest]] = []
-
-        while remaining:
-            if scheduler.has_acceptance_samples and scheduler.rolling_accept_rate < config.SCHED_MIN_ROLLING_ACCEPT_RATE:
-                print(
-                    f"  Rolling accept rate {scheduler.rolling_accept_rate:.2f} "
-                    f"< {config.SCHED_MIN_ROLLING_ACCEPT_RATE} — demoting {len(remaining)} request(s) to baseline"
-                )
-                demoted.extend(remaining)
-                remaining = []
-                break
-
-            chunk = remaining[: config.SCHED_SPEC_CHUNK_SIZE]
-            remaining = remaining[config.SCHED_SPEC_CHUNK_SIZE :]
-
-            chunk_reqs = [r for _, r in chunk]
-            start = time.perf_counter()
-            chunk_out = []
-            for req in chunk_reqs:
-                chunk_out.extend(
-                    llm.generate([req.prompt], sampling_params_for([req])[0])
-                )
-            total_elapsed_s += time.perf_counter() - start
-
-            stats = spec_decode_stats(llm, config.NUM_SPECULATIVE_TOKENS)
-            scheduler.record_acceptance(stats["mean_acceptance_length"])
-            spec_stats_agg = stats
-
-            for (idx, _), out in zip(chunk, chunk_out):
-                outputs_by_idx[idx] = out
-            executed_spec += len(chunk)
-
-            print(
-                f"  chunk done: rolling accept={scheduler.rolling_accept_rate:.2f}, "
-                f"remaining={len(remaining)}"
+    tokens = executed = 0
+    elapsed = 0.0
+    demoted, logs, stats = [], [], None
+    remaining = list(reqs)
+    while remaining:
+        if sched.has_acceptance_samples and sched.rolling_accept_rate < config.SCHED_MIN_ROLLING_ACCEPT_RATE:
+            demoted = [idx for idx, _, _, _ in remaining]
+            logs.append(
+                f"  rolling accept {sched.rolling_accept_rate:.2f} < "
+                f"{config.SCHED_MIN_ROLLING_ACCEPT_RATE} — demoting {len(remaining)} to baseline"
             )
+            break
+        chunk = remaining[: config.SCHED_SPEC_CHUNK_SIZE]
+        remaining = remaining[config.SCHED_SPEC_CHUNK_SIZE :]
+        t1 = time.perf_counter()
+        outs = llm.generate([p for _, p, _, _ in chunk], _params(chunk))
+        elapsed += time.perf_counter() - t1
+        stats = spec_decode_stats(llm, config.NUM_SPECULATIVE_TOKENS)
+        sched.record_acceptance(stats["mean_acceptance_length"])
+        tokens += _tokens(outs)
+        executed += len(chunk)
+        logs.append(f"  chunk done: rolling accept={sched.rolling_accept_rate:.2f}, remaining={len(remaining)}")
 
-        baseline_queue.extend(demoted)
-        unload_llm(llm)
-        print("GPU memory settling before baseline engine load...")
-        release_gpu()
+    q.put({
+        "output_tokens": tokens,
+        "executed": executed,
+        "demoted": demoted,
+        "elapsed_s": elapsed,
+        "load_s": load_s,
+        "spec_stats": stats,
+        "logs": logs,
+    })
 
-    if baseline_queue:
-        print(f"\n--- Baseline engine: {len(baseline_queue)} request(s) ---")
-        load_start = time.perf_counter()
-        llm = build_llm(use_speculative=False)
-        total_load_s += time.perf_counter() - load_start
-        print(f"Baseline engine ready in {time.perf_counter() - load_start:.1f}s")
 
-        baseline_queue.sort(key=lambda x: x[0])
-        base_reqs = [r for _, r in baseline_queue]
-        _ = llm.generate([base_reqs[0].prompt], sampling_params_for([base_reqs[0]])[0])
-
-        start = time.perf_counter()
-        base_out = llm.generate(
-            [r.prompt for r in base_reqs],
-            sampling_params_for(base_reqs),
-        )
-        total_elapsed_s += time.perf_counter() - start
-
-        for (idx, _), out in zip(baseline_queue, base_out):
-            outputs_by_idx[idx] = out
-        executed_baseline = len(baseline_queue)
-
-        unload_llm(llm)
-
-    ordered_outputs = [outputs_by_idx[i] for i in range(len(requests))]
-    total_tokens = count_output_tokens(ordered_outputs)
-    tokens_per_sec = total_tokens / total_elapsed_s if total_elapsed_s else 0.0
-    sec_per_request = total_elapsed_s / len(requests) if requests else 0.0
-
-    routed_spec_initial = sum(1 for d in scheduler.routing_log if d.use_speculation)
-    routed_base_initial = len(scheduler.routing_log) - routed_spec_initial
-    reasons = scheduler.reason_counts()
-
-    result = {
-        "name": name,
-        "prompts": len(requests),
-        "output_tokens": total_tokens,
-        "elapsed_s": total_elapsed_s,
-        "tokens_per_sec": tokens_per_sec,
-        "sec_per_request": sec_per_request,
-        "load_s": total_load_s,
-        "routed_spec": routed_spec_initial,
-        "routed_base": routed_base_initial,
-        "executed_spec": executed_spec,
-        "executed_baseline": executed_baseline,
-        "routing_reasons": dict(reasons),
-        "final_rolling_accept_rate": scheduler.rolling_accept_rate,
-    }
-    if spec_stats_agg:
-        result["spec_stats"] = spec_stats_agg
-
-    print(f"\n--- {name} results ---")
-    print(f"  prompts:         {len(requests)}")
-    print(f"  routed spec (initial): {routed_spec_initial}")
-    print(f"  routed baseline (initial): {routed_base_initial}")
-    print(f"  executed on spec engine: {executed_spec}")
-    print(f"  executed on baseline engine: {executed_baseline}")
-    print(f"  routing reasons: {dict(reasons)}")
-    print(f"  output tokens:   {total_tokens}")
-    print(f"  inference time:  {total_elapsed_s:.2f}s  (excludes engine reload)")
-    print(f"  engine load:     {total_load_s:.1f}s")
-    print(f"  throughput:      {tokens_per_sec:.1f} tok/s")
-    print(f"  latency/request: {sec_per_request:.2f}s")
-    if spec_stats_agg:
-        print_spec_decode_report(spec_stats_agg)
-
+def _spawn(target, *args):
+    """Run a worker in a fresh process; its GPU memory frees when it exits."""
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    proc = ctx.Process(target=target, args=(*args, q))
+    proc.start()
+    result = q.get()
+    proc.join()
     return result
 
 
-def print_comparison(baseline: dict, always_spec: dict, selective: dict) -> None:
-    spec_gain = (always_spec["tokens_per_sec"] / baseline["tokens_per_sec"] - 1) * 100
-    sel_gain = (selective["tokens_per_sec"] / baseline["tokens_per_sec"] - 1) * 100
-    sel_vs_spec = (selective["tokens_per_sec"] / always_spec["tokens_per_sec"] - 1) * 100
+def _print_spec(stats: dict | None) -> None:
+    if not stats:
+        return
+    print("\n--- Speculative decoding stats ---")
+    print(f"  drafts: {stats['num_drafts']}  draft tokens: {stats['num_draft_tokens']}  accepted: {stats['num_accepted_tokens']}")
+    print(f"  mean accept len: {stats['mean_acceptance_length']:.2f}  draft accept %: {stats['draft_accept_rate'] * 100:.1f}")
+    for i, c in enumerate(stats["acceptance_by_pos"]):
+        rate = c / stats["num_drafts"] if stats["num_drafts"] else 0.0
+        print(f"  pos {i} accept rate: {rate * 100:.1f}%")
 
-    print(f"\n{'=' * 60}")
-    print("COMPARISON")
-    print(f"{'=' * 60}")
+
+def run_homogeneous(name: str, use_speculative: bool, reqs: list[tuple]) -> dict:
+    print(f"\n{'=' * 60}\n{name}\n{'=' * 60}")
+    r = _spawn(_run_engine, use_speculative, reqs)
+    print(f"  engine load:     {r['load_s']:.1f}s")
+    print(f"  output tokens:   {r['output_tokens']}  wall: {r['elapsed_s']:.2f}s")
+    print(f"  throughput:      {r['tokens_per_sec']:.1f} tok/s  latency/req: {r['sec_per_request']:.2f}s")
+    _print_spec(r.get("spec_stats"))
+    return r
+
+
+def run_selective(requests) -> dict:
+    print(f"\n{'=' * 60}\nselective speculation scheduler\n{'=' * 60}")
+    sched = SelectiveSpecScheduler()
+    spec, base = [], []
+    for idx, req in enumerate(requests):
+        decision = sched.decide(prompt_token_count(req.prompt), req.temperature)
+        sched.log_decision(decision)
+        entry = (idx, req.prompt, req.temperature, req.max_tokens)
+        (spec if decision.use_speculation else base).append(entry)
+    routed_spec = sum(1 for d in sched.routing_log if d.use_speculation)
+    print(f"  routing: {routed_spec} spec / {len(sched.routing_log) - routed_spec} baseline  {dict(sched.reason_counts())}")
+
+    tokens = elapsed = load = 0.0
+    executed_spec = 0
+    stats = None
+    if spec:
+        sr = _spawn(_run_spec_phase, spec)
+        for line in sr["logs"]:
+            print(line)
+        tokens += sr["output_tokens"]
+        elapsed += sr["elapsed_s"]
+        load += sr["load_s"]
+        executed_spec = sr["executed"]
+        stats = sr["spec_stats"]
+        base += [(i, requests[i].prompt, requests[i].temperature, requests[i].max_tokens) for i in sr["demoted"]]
+    if base:
+        br = _spawn(_run_engine, False, base)
+        tokens += br["output_tokens"]
+        elapsed += br["elapsed_s"]
+        load += br["load_s"]
+
+    tps = tokens / elapsed if elapsed else 0.0
+    r = {
+        "output_tokens": tokens,
+        "elapsed_s": elapsed,
+        "load_s": load,
+        "tokens_per_sec": tps,
+        "sec_per_request": elapsed / len(requests) if requests else 0.0,
+        "executed_spec": executed_spec,
+        "executed_baseline": len(base),
+        "routing_reasons": dict(sched.reason_counts()),
+        "spec_stats": stats,
+    }
+    print(f"  executed:        {executed_spec} spec / {len(base)} baseline")
+    print(f"  output tokens:   {tokens}  inference: {elapsed:.2f}s  load: {load:.1f}s")
+    print(f"  throughput:      {tps:.1f} tok/s  latency/req: {r['sec_per_request']:.2f}s")
+    _print_spec(stats)
+    return r
+
+
+def print_comparison(baseline: dict, spec: dict, sel: dict) -> None:
+    def gain(a, b):
+        return (a / b - 1) * 100 if b else 0.0
+
+    print(f"\n{'=' * 60}\nCOMPARISON (batched)\n{'=' * 60}")
     print(
-        f"  Throughput (tok/s):  baseline {baseline['tokens_per_sec']:.1f} | "
-        f"always-spec {always_spec['tokens_per_sec']:.1f} ({spec_gain:+.1f}%) | "
-        f"selective {selective['tokens_per_sec']:.1f} ({sel_gain:+.1f}% vs base, {sel_vs_spec:+.1f}% vs always-spec)"
+        f"  throughput tok/s:  baseline {baseline['tokens_per_sec']:.1f} | "
+        f"always-spec {spec['tokens_per_sec']:.1f} ({gain(spec['tokens_per_sec'], baseline['tokens_per_sec']):+.1f}%) | "
+        f"selective {sel['tokens_per_sec']:.1f} ({gain(sel['tokens_per_sec'], baseline['tokens_per_sec']):+.1f}% vs base)"
     )
-    print(
-        f"  Latency/request (s): baseline {baseline['sec_per_request']:.2f} | "
-        f"always-spec {always_spec['sec_per_request']:.2f} | "
-        f"selective {selective['sec_per_request']:.2f}"
-    )
-    if "spec_stats" in always_spec:
-        print(f"  Always-spec mean accept length: {always_spec['spec_stats']['mean_acceptance_length']:.2f}")
-    print(f"  Selective routing: {selective['executed_spec']} spec / {selective['executed_baseline']} baseline (executed)")
-    print(f"  Selective routing reasons: {selective['routing_reasons']}")
-    print()
-    print("Resume line examples:")
-    print(
-        f'  "Implemented EAGLE3 speculative decoding in vLLM on {config.HARDWARE_LABEL} '
-        f"(TP={config.TENSOR_PARALLEL_SIZE}), improving decode throughput by "
-        f'{max(spec_gain, 0):.0f}% with mean acceptance length '
-        f'{always_spec.get("spec_stats", {}).get("mean_acceptance_length", 0):.2f}."'
-    )
-    print(
-        f'  "Designed a runtime scheduler that selectively enabled speculative decoding '
-        f"based on prompt length, sampling temperature, and rolling draft acceptance rate, "
-        f'routing {selective["executed_spec"]}/{selective["prompts"]} requests to EAGLE3."'
-    )
+    if spec.get("spec_stats"):
+        print(f"  always-spec mean accept length: {spec['spec_stats']['mean_acceptance_length']:.2f}")
+    print(f"  selective routed: {sel['executed_spec']} spec / {sel['executed_baseline']} baseline  {sel['routing_reasons']}")
 
 
 def main() -> None:
+    import torch
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--quick", action="store_true", help="Use a small mixed workload (7 prompts)")
+    parser.add_argument("--quick", action="store_true", help="small 7-prompt workload")
     args = parser.parse_args()
 
-    requests = QUICK_WORKLOAD if args.quick else WORKLOAD
-
     if torch.cuda.device_count() < config.TENSOR_PARALLEL_SIZE:
-        raise SystemExit(
-            f"Need {config.TENSOR_PARALLEL_SIZE} GPU(s) for TP={config.TENSOR_PARALLEL_SIZE}."
-        )
+        raise SystemExit(f"Need {config.TENSOR_PARALLEL_SIZE} GPU(s). Run: python gpu_check.py")
 
-    print(f"Workload: {len(requests)} requests")
-    print(f"  model: {config.TARGET_MODEL}")
-    cats = Counter(r.category for r in requests)
-    print(f"  categories: {dict(cats)}")
+    requests = QUICK_WORKLOAD if args.quick else WORKLOAD
+    reqs = [(i, r.prompt, r.temperature, r.max_tokens) for i, r in enumerate(requests)]
+    print(f"Workload: {len(requests)} requests  categories: {dict(Counter(r.category for r in requests))}")
 
-    baseline = run_homogeneous("baseline (no speculative decoding)", use_speculative=False, requests=requests)
-    always_spec = run_homogeneous("EAGLE3 always-on", use_speculative=True, requests=requests)
-    selective = run_selective(requests)
-    print_comparison(baseline, always_spec, selective)
+    baseline = run_homogeneous("baseline (no speculative decoding)", False, reqs)
+    spec = run_homogeneous("EAGLE3 always-on", True, reqs)
+    sel = run_selective(requests)
+    print_comparison(baseline, spec, sel)
 
 
 if __name__ == "__main__":
