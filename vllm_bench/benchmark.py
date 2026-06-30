@@ -30,6 +30,7 @@ def _build_llm(use_speculative: bool):
         "gpu_memory_utilization": config.GPU_MEMORY_UTILIZATION,
         "max_num_seqs": 1,
         "trust_remote_code": True,
+        "disable_log_stats": False,  # required for spec_decode_stats() / rolling demotion
     }
     if use_speculative:
         kwargs["speculative_config"] = {
@@ -96,13 +97,6 @@ def _run_spec_phase(reqs: list[Request], q) -> None:
     stats = None
     remaining = list(reqs)
     while remaining:
-        if sched.has_acceptance_samples and sched.rolling_accept_rate < config.SCHED_MIN_ROLLING_ACCEPT_RATE:
-            demoted.extend(remaining)
-            logs.append(
-                f"  rolling accept {sched.rolling_accept_rate:.2f} < "
-                f"{config.SCHED_MIN_ROLLING_ACCEPT_RATE} — demoting {len(remaining)} to baseline"
-            )
-            break
         req = remaining.pop(0)
         _, prompt, temp, max_tok = req
         t0 = time.perf_counter()
@@ -113,6 +107,17 @@ def _run_spec_phase(reqs: list[Request], q) -> None:
         tokens += _out_tokens(outs)
         executed += 1
         logs.append(f"  spec {executed}/{len(reqs)}: rolling accept={sched.rolling_accept_rate:.2f}")
+        if (
+            stats["num_drafts"]
+            and sched.has_acceptance_samples
+            and sched.rolling_accept_rate < config.SCHED_MIN_ROLLING_ACCEPT_RATE
+        ):
+            demoted.extend(remaining)
+            logs.append(
+                f"  rolling accept {sched.rolling_accept_rate:.2f} < "
+                f"{config.SCHED_MIN_ROLLING_ACCEPT_RATE} — demoting {len(remaining)} to baseline"
+            )
+            break
 
     q.put({
         "output_tokens": tokens,

@@ -35,6 +35,9 @@ def print_spec_summary(stats: dict | None) -> None:
     if not stats:
         return
     print("\n--- Speculative decoding stats ---")
+    if stats["num_drafts"] == 0:
+        print("  (no counters — set disable_log_stats=False on LLM)")
+        return
     print(
         f"  mean accept len: {stats['mean_acceptance_length']:.2f}  "
         f"draft accept %: {stats['draft_accept_rate'] * 100:.1f}"
