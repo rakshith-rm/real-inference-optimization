@@ -53,18 +53,27 @@ def _tokens(outs) -> int:
     return sum(len(o.outputs[0].token_ids) for o in outs)
 
 
-def _batched_generate(llm, reqs: list[tuple]) -> tuple[int, float]:
-    """Same chunked batching for every mode — avoids EAGLE3 hang on large batches."""
+def _iter_batches(reqs: list[tuple]):
+    """Chunk by size, never mixing temp bands (EAGLE3 hangs on mixed temp in one batch)."""
     chunk = config.GENERATE_CHUNK_SIZE
+    cutoff = config.SCHED_MAX_SPEC_TEMPERATURE
+    low = [r for r in reqs if r[2] <= cutoff]
+    high = [r for r in reqs if r[2] > cutoff]
+    for label, group in (("low-temp", low), ("high-temp", high)):
+        for i in range(0, len(group), chunk):
+            yield label, group[i : i + chunk]
+
+
+def _batched_generate(llm, reqs: list[tuple]) -> tuple[int, float]:
     total_tokens = 0
     elapsed = 0.0
-    for i in range(0, len(reqs), chunk):
-        batch = reqs[i : i + chunk]
+    batches = list(_iter_batches(reqs))
+    for n, (label, batch) in enumerate(batches, 1):
         t0 = time.perf_counter()
         outs = llm.generate([p for _, p, _, _ in batch], _params(batch))
         elapsed += time.perf_counter() - t0
         total_tokens += _tokens(outs)
-        print(f"    batch {i // chunk + 1}/{(len(reqs) + chunk - 1) // chunk} done ({len(batch)} prompts)", flush=True)
+        print(f"    batch {n}/{len(batches)} ({label}, {len(batch)} prompts)", flush=True)
     return total_tokens, elapsed
 
 
