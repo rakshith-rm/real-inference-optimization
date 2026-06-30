@@ -1,9 +1,8 @@
 ﻿"""
 Baseline vs EAGLE3 vs selective speculation scheduler (vLLM).
 
-Each engine runs in its own subprocess, so its GPU memory is fully reclaimed when
-the process exits — a simple, reliable fix for the reload OOM. All three modes
-generate in a single batch, so the comparison is fair.
+Each engine runs in its own subprocess (GPU memory freed on exit).
+All three modes generate in the same small batched chunks (GENERATE_CHUNK_SIZE).
 
 Run:
   python gpu_check.py
@@ -30,7 +29,7 @@ def _build_llm(use_speculative: bool):
         "model": config.TARGET_MODEL,
         "tensor_parallel_size": config.TENSOR_PARALLEL_SIZE,
         "gpu_memory_utilization": config.GPU_MEMORY_UTILIZATION,
-        "max_num_seqs": config.MAX_NUM_SEQS,
+        "max_num_seqs": config.GENERATE_CHUNK_SIZE,
         "trust_remote_code": True,
         "disable_log_stats": False,
     }
@@ -54,23 +53,31 @@ def _tokens(outs) -> int:
     return sum(len(o.outputs[0].token_ids) for o in outs)
 
 
+def _batched_generate(llm, reqs: list[tuple]) -> tuple[int, float]:
+    """Same chunked batching for every mode — avoids EAGLE3 hang on large batches."""
+    chunk = config.GENERATE_CHUNK_SIZE
+    total_tokens = 0
+    elapsed = 0.0
+    for i in range(0, len(reqs), chunk):
+        batch = reqs[i : i + chunk]
+        t0 = time.perf_counter()
+        outs = llm.generate([p for _, p, _, _ in batch], _params(batch))
+        elapsed += time.perf_counter() - t0
+        total_tokens += _tokens(outs)
+        print(f"    batch {i // chunk + 1}/{(len(reqs) + chunk - 1) // chunk} done ({len(batch)} prompts)", flush=True)
+    return total_tokens, elapsed
+
+
 def _run_engine(use_speculative: bool, reqs: list[tuple], q) -> None:
-    """Subprocess: load one engine, generate the whole batch, return metrics."""
     from metrics import spec_decode_stats
 
     t0 = time.perf_counter()
     llm = _build_llm(use_speculative)
     load_s = time.perf_counter() - t0
 
-    prompts = [p for _, p, _, _ in reqs]
-    params = _params(reqs)
-    llm.generate(prompts[:1], params[0])  # warmup, excluded from timing
+    llm.generate([reqs[0][1]], _params(reqs[:1])[0])  # warmup
 
-    t1 = time.perf_counter()
-    outs = llm.generate(prompts, params)
-    elapsed = time.perf_counter() - t1
-
-    tokens = _tokens(outs)
+    tokens, elapsed = _batched_generate(llm, reqs)
     result = {
         "output_tokens": tokens,
         "elapsed_s": elapsed,
@@ -84,14 +91,13 @@ def _run_engine(use_speculative: bool, reqs: list[tuple], q) -> None:
 
 
 def _run_spec_phase(reqs: list[tuple], q) -> None:
-    """Subprocess: spec engine, batched chunks with rolling-accept demotion."""
     from metrics import spec_decode_stats
 
     sched = SelectiveSpecScheduler()
     t0 = time.perf_counter()
     llm = _build_llm(True)
     load_s = time.perf_counter() - t0
-    llm.generate([reqs[0][1]], _params(reqs[:1])[0])  # warmup
+    llm.generate([reqs[0][1]], _params(reqs[:1])[0])
 
     tokens = executed = 0
     elapsed = 0.0
@@ -128,7 +134,6 @@ def _run_spec_phase(reqs: list[tuple], q) -> None:
 
 
 def _spawn(target, *args):
-    """Run a worker in a fresh process; its GPU memory frees when it exits."""
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     proc = ctx.Process(target=target, args=(*args, q))
@@ -142,7 +147,6 @@ def _print_spec(stats: dict | None) -> None:
     if not stats:
         return
     print("\n--- Speculative decoding stats ---")
-    print(f"  drafts: {stats['num_drafts']}  draft tokens: {stats['num_draft_tokens']}  accepted: {stats['num_accepted_tokens']}")
     print(f"  mean accept len: {stats['mean_acceptance_length']:.2f}  draft accept %: {stats['draft_accept_rate'] * 100:.1f}")
     for i, c in enumerate(stats["acceptance_by_pos"]):
         rate = c / stats["num_drafts"] if stats["num_drafts"] else 0.0
@@ -213,7 +217,7 @@ def print_comparison(baseline: dict, spec: dict, sel: dict) -> None:
     def gain(a, b):
         return (a / b - 1) * 100 if b else 0.0
 
-    print(f"\n{'=' * 60}\nCOMPARISON (batched)\n{'=' * 60}")
+    print(f"\n{'=' * 60}\nCOMPARISON (chunk={config.GENERATE_CHUNK_SIZE})\n{'=' * 60}")
     print(
         f"  throughput tok/s:  baseline {baseline['tokens_per_sec']:.1f} | "
         f"always-spec {spec['tokens_per_sec']:.1f} ({gain(spec['tokens_per_sec'], baseline['tokens_per_sec']):+.1f}%) | "
@@ -236,7 +240,8 @@ def main() -> None:
 
     requests = QUICK_WORKLOAD if args.quick else WORKLOAD
     reqs = [(i, r.prompt, r.temperature, r.max_tokens) for i, r in enumerate(requests)]
-    print(f"Workload: {len(requests)} requests  categories: {dict(Counter(r.category for r in requests))}")
+    print(f"Workload: {len(requests)} requests  chunk={config.GENERATE_CHUNK_SIZE}")
+    print(f"  categories: {dict(Counter(r.category for r in requests))}")
 
     baseline = run_homogeneous("baseline (no speculative decoding)", False, reqs)
     spec = run_homogeneous("EAGLE3 always-on", True, reqs)

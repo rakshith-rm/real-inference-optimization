@@ -19,11 +19,9 @@ NUM_SPECULATIVE_TOKENS = 2
 MAX_OUTPUT_TOKENS = 256
 GPU_MEMORY_UTILIZATION = 0.85
 
-# Cap concurrent sequences (same for all engines, so the comparison stays fair).
-# EAGLE3 spec decode is a low-batch technique — verifying k draft tokens for a
-# huge batch stalls the engine (35 prompts at once hangs it). A modest cap keeps
-# generation batched while staying in the regime where speculation actually helps.
-MAX_NUM_SEQS = 16
+# Batch size for llm.generate() — same for all three modes (fair comparison).
+# EAGLE3 hangs if you submit all 35 prompts in one call; chunking avoids that.
+GENERATE_CHUNK_SIZE = 4
 
 # Sampling: temperature=0 keeps benchmark numbers reproducible
 TEMPERATURE = 0.0
