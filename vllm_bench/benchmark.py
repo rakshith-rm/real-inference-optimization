@@ -2,7 +2,10 @@
 Baseline vs EAGLE3 vs selective speculation scheduler (vLLM).
 
 Each engine runs in its own subprocess (GPU memory freed on exit).
-All three modes generate in the same small batched chunks (GENERATE_CHUNK_SIZE).
+All three modes use the same generate loop (one prompt per llm.generate call).
+
+vLLM 0.11 EAGLE3 hangs on batched spec (batch>1) on mixed workloads — batch=1
+is required for stability and is the fair comparison point for spec decoding anyway.
 
 Run:
   python gpu_check.py
@@ -29,7 +32,7 @@ def _build_llm(use_speculative: bool):
         "model": config.TARGET_MODEL,
         "tensor_parallel_size": config.TENSOR_PARALLEL_SIZE,
         "gpu_memory_utilization": config.GPU_MEMORY_UTILIZATION,
-        "max_num_seqs": config.GENERATE_CHUNK_SIZE,
+        "max_num_seqs": 1,
         "trust_remote_code": True,
         "disable_log_stats": False,
     }
@@ -53,27 +56,17 @@ def _tokens(outs) -> int:
     return sum(len(o.outputs[0].token_ids) for o in outs)
 
 
-def _iter_batches(reqs: list[tuple]):
-    """Chunk by size, never mixing temp bands (EAGLE3 hangs on mixed temp in one batch)."""
-    chunk = config.GENERATE_CHUNK_SIZE
-    cutoff = config.SCHED_MAX_SPEC_TEMPERATURE
-    low = [r for r in reqs if r[2] <= cutoff]
-    high = [r for r in reqs if r[2] > cutoff]
-    for label, group in (("low-temp", low), ("high-temp", high)):
-        for i in range(0, len(group), chunk):
-            yield label, group[i : i + chunk]
-
-
-def _batched_generate(llm, reqs: list[tuple]) -> tuple[int, float]:
+def _generate_all(llm, reqs: list[tuple]) -> tuple[int, float]:
+    """One prompt per generate call — same for all modes, stable on vLLM 0.11."""
     total_tokens = 0
     elapsed = 0.0
-    batches = list(_iter_batches(reqs))
-    for n, (label, batch) in enumerate(batches, 1):
+    for n, req in enumerate(reqs, 1):
         t0 = time.perf_counter()
-        outs = llm.generate([p for _, p, _, _ in batch], _params(batch))
+        outs = llm.generate([req[1]], _params([req])[0])
         elapsed += time.perf_counter() - t0
         total_tokens += _tokens(outs)
-        print(f"    batch {n}/{len(batches)} ({label}, {len(batch)} prompts)", flush=True)
+        if n % 5 == 0 or n == len(reqs):
+            print(f"    {n}/{len(reqs)} prompts done", flush=True)
     return total_tokens, elapsed
 
 
@@ -86,7 +79,7 @@ def _run_engine(use_speculative: bool, reqs: list[tuple], q) -> None:
 
     llm.generate([reqs[0][1]], _params(reqs[:1])[0])  # warmup
 
-    tokens, elapsed = _batched_generate(llm, reqs)
+    tokens, elapsed = _generate_all(llm, reqs)
     result = {
         "output_tokens": tokens,
         "elapsed_s": elapsed,
@@ -114,22 +107,21 @@ def _run_spec_phase(reqs: list[tuple], q) -> None:
     remaining = list(reqs)
     while remaining:
         if sched.has_acceptance_samples and sched.rolling_accept_rate < config.SCHED_MIN_ROLLING_ACCEPT_RATE:
-            demoted = [idx for idx, _, _, _ in remaining]
+            demoted.extend(r[0] for r in remaining)
             logs.append(
                 f"  rolling accept {sched.rolling_accept_rate:.2f} < "
                 f"{config.SCHED_MIN_ROLLING_ACCEPT_RATE} — demoting {len(remaining)} to baseline"
             )
             break
-        chunk = remaining[: config.SCHED_SPEC_CHUNK_SIZE]
-        remaining = remaining[config.SCHED_SPEC_CHUNK_SIZE :]
+        req = remaining.pop(0)
         t1 = time.perf_counter()
-        outs = llm.generate([p for _, p, _, _ in chunk], _params(chunk))
+        outs = llm.generate([req[1]], _params([req])[0])
         elapsed += time.perf_counter() - t1
         stats = spec_decode_stats(llm, config.NUM_SPECULATIVE_TOKENS)
         sched.record_acceptance(stats["mean_acceptance_length"])
         tokens += _tokens(outs)
-        executed += len(chunk)
-        logs.append(f"  chunk done: rolling accept={sched.rolling_accept_rate:.2f}, remaining={len(remaining)}")
+        executed += 1
+        logs.append(f"  spec {executed}/{len(reqs)}: rolling accept={sched.rolling_accept_rate:.2f}")
 
     q.put({
         "output_tokens": tokens,
@@ -226,7 +218,7 @@ def print_comparison(baseline: dict, spec: dict, sel: dict) -> None:
     def gain(a, b):
         return (a / b - 1) * 100 if b else 0.0
 
-    print(f"\n{'=' * 60}\nCOMPARISON (chunk={config.GENERATE_CHUNK_SIZE})\n{'=' * 60}")
+    print(f"\n{'=' * 60}\nCOMPARISON (batch=1, fair)\n{'=' * 60}")
     print(
         f"  throughput tok/s:  baseline {baseline['tokens_per_sec']:.1f} | "
         f"always-spec {spec['tokens_per_sec']:.1f} ({gain(spec['tokens_per_sec'], baseline['tokens_per_sec']):+.1f}%) | "
@@ -249,7 +241,7 @@ def main() -> None:
 
     requests = QUICK_WORKLOAD if args.quick else WORKLOAD
     reqs = [(i, r.prompt, r.temperature, r.max_tokens) for i, r in enumerate(requests)]
-    print(f"Workload: {len(requests)} requests  chunk={config.GENERATE_CHUNK_SIZE}")
+    print(f"Workload: {len(requests)} requests  (batch=1, all modes)")
     print(f"  categories: {dict(Counter(r.category for r in requests))}")
 
     baseline = run_homogeneous("baseline (no speculative decoding)", False, reqs)

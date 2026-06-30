@@ -19,11 +19,6 @@ NUM_SPECULATIVE_TOKENS = 2
 MAX_OUTPUT_TOKENS = 256
 GPU_MEMORY_UTILIZATION = 0.85
 
-# Batch size for llm.generate() — same for all three modes (fair comparison).
-# Batches are split by temperature band first (vLLM 0.11 EAGLE3 hangs if temp=0
-# and temp=1.0 prompts share one batch), then chunked to this size.
-GENERATE_CHUNK_SIZE = 4
-
 # Sampling: temperature=0 keeps benchmark numbers reproducible
 TEMPERATURE = 0.0
 
@@ -32,5 +27,4 @@ SCHED_MIN_PROMPT_TOKENS = 64
 SCHED_MAX_SPEC_TEMPERATURE = 0.8
 SCHED_MIN_ROLLING_ACCEPT_RATE = 1.2
 SCHED_ROLLING_WINDOW = 8
-SCHED_SPEC_CHUNK_SIZE = 4
 SCHED_INITIAL_ACCEPT_RATE = 2.0
