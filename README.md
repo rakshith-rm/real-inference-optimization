@@ -2,11 +2,23 @@
 
 A **selective speculation scheduler** for vLLM that routes each request to baseline decode or EAGLE3 speculative decoding based on prompt length, sampling temperature, and rolling draft acceptance.
 
-Validated on **Llama-3.1-8B** + **EAGLE3** (k=2) with vLLM 0.11 on 1× NVIDIA A6000 (48GB), TP=1, against always-on speculation and a no-spec baseline.
+Validated on **Llama-3.1-8B** + **EAGLE3** (k=2) with vLLM 0.11, TP=1, against always-on speculation and a no-spec baseline. Same 35-prompt mixed workload, batch=1.
 
 ## Validation results
 
-Mixed workload (35 requests: short, high-temp, long analytical, long context). Generation at batch=1 for fair comparison and stable EAGLE3 on vLLM 0.11.
+### NVIDIA H200 (141GB)
+
+| Mode | Throughput | vs baseline | Inference | Tokens |
+|------|------------|-------------|-----------|--------|
+| Baseline | 181.9 tok/s | — | 39s | 7,012 |
+| Always EAGLE3 | 192.0 tok/s | **+5.6%** | 37s | 7,012 |
+| Selective scheduler | 189.5 tok/s | **+4.2%** | 37s | 7,012 |
+
+**Always-on spec:** mean accept length 1.58, draft accept 29.2%  
+**Selective spec (6 routed):** mean accept length 1.84, draft accept 41.8%  
+**Routing:** 6 spec / 29 baseline — `short_prompt: 29`, `spec_enabled: 6`; all 6 spec requests ran (rolling accept ~1.84–1.85, no demotion)
+
+### NVIDIA A6000 (48GB)
 
 | Mode | Throughput | vs baseline | Inference | Tokens |
 |------|------------|-------------|-----------|--------|
@@ -15,15 +27,17 @@ Mixed workload (35 requests: short, high-temp, long analytical, long context). G
 | Selective scheduler | 43.7 tok/s | **+6.5%** | 157s | 6,859 |
 
 **Always-on spec:** mean accept length 1.59, draft accept 29.7%  
-**Selective spec (6 routed requests):** mean accept length 1.75, draft accept 37.3%  
-**Routing:** 6 spec / 29 baseline — `short_prompt: 29`, `spec_enabled: 6`
+**Selective spec (6 routed):** mean accept length 1.75, draft accept 37.3%  
+**Routing:** 6 spec / 29 baseline — same split as H200
+
+Both runs completed cleanly (no hangs, no OOM).
 
 ### What we learned
 
-- Always-on EAGLE3 delivers ~23% higher throughput than baseline on this stack at low batch / TP=1.
-- The scheduler improves over baseline with conservative defaults, but trails always-on because only **6/35** requests met the routing criteria (long context, prompt ≥64 tokens).
-- Routed traffic shows **higher acceptance** (1.75 vs 1.59) — the policy selects well; widening thresholds to match production traffic should close the gap with always-on.
-- Evaluation ran cleanly (no hangs, no OOM). Each engine phase uses a **subprocess** so GPU memory is released between baseline and spec runs.
+- **H200 (faster GPU):** absolute tok/s is much higher, but EAGLE3 relative gain is ~6% — less decode-bound at batch=1.
+- **A6000 (decode-bound):** always-on EAGLE3 delivers ~23% higher throughput; selective +6.5% with conservative routing.
+- **Both GPUs:** scheduler routes only **6/35** requests (long context, prompt ≥64 tokens); routed traffic shows **higher acceptance** than always-on (quality over quantity).
+- Widening thresholds for production traffic should close the selective vs always-on gap. Each engine phase uses a **subprocess** so GPU memory is released between runs.
 
 ## Selective scheduler
 
